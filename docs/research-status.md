@@ -1,6 +1,6 @@
 # Research status and next steps
 
-_25 September 2026 — handoff note_
+_25 September 2026 — handoff note; updated 4 October 2026_
 
 ## Aim
 
@@ -50,12 +50,24 @@ query intersects shifted bit planes to find matching endpoints, then reads
 target bytes at the requested distance. It does **not** materialize a table
 for every pattern, distance, and target.
 
-The CLI provides `build`, `query`, and `profile`. `profile` reports support,
-empirical entropy, signed entropy change from the previous distance, and the
-most common target byte. The index format is versioned and currently requires
+The CLI provides `build`, `query`, `profile`, `cooccur`, and `events`.
+`profile` reports support, empirical entropy, signed entropy change from the
+previous distance, and the most common target byte. `cooccur` implements
+`cooccur(A, B, d)` for a masked event `B`; `events` lists the observed
+contiguous blocks of one length at distance `d`, so candidate `B` sequences
+come from the corpus instead of from enumeration. `baseline` and `predict`
+implement the contiguous-suffix Kneser–Ney control described below, using a
+suffix array over the training text
+([`src/mobius/kneser_ney.cr`](../src/mobius/kneser_ney.cr),
+[`src/mobius/suffix_array.cr`](../src/mobius/suffix_array.cr)). The index format is versioned and currently requires
 a little-endian machine. [`spec/mobius_spec.cr`](../spec/mobius_spec.cr) covers
-wildcards, canonicalization, distant targets, bit-word boundaries, and an
-index round trip. Seven specs pass.
+wildcards, canonicalization, distant targets, bit-word boundaries, an index
+round trip, joint counts against a direct scan, and a corpus whose
+continuations `{ab, ba}` and `{aa, bb}` have identical single-byte marginals.
+[`spec/kneser_ney_spec.cr`](../spec/kneser_ney_spec.cr) checks the suffix array
+against direct sorting and counting, and the Kneser–Ney model against a
+brute-force implementation at every held-out position and context limit.
+Seventeen specs pass.
 
 Tiny Shakespeare at `~/Projects/agpt/data/input.txt` contains 1,115,394 bytes
 and 65 observed byte values. Its raw bit planes occupy 9,063,080 bytes; the
@@ -75,11 +87,29 @@ CRYSTAL_CACHE_DIR=/tmp/mobius-crystal-cache crystal spec
 The compiler cache override keeps Crystal's generated files in a writable
 location in the current sandbox.
 
-There is no `cooccur` query, automatic pattern miner, smoothed predictor,
-semantic-similarity index, or prediction evidence table yet. Those are the
+There is no automatic pattern miner, masked or distant predictor, or
+semantic-similarity index yet. Those are the
 proposed next layers.
 
 ## Observations worth keeping
+
+### The contiguous-suffix baseline to beat
+
+Interpolated modified Kneser–Ney over contiguous suffixes, nanoGPT's 90/10
+split, context limit chosen on the last 10% of the training text:
+
+| Context limit | 0 | 2 | 4 | 5 | **6** | 8 | 12 | 16 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Dev bits/byte | 4.773 | 2.907 | 2.204 | 2.154 | **2.152** | 2.166 | 2.166 | 2.165 |
+
+Held-out result at limit 6: **2.1887 bits per byte (1.5171 nats)**. For
+comparison, nanoGPT's README reports about 1.47 nats (about 2.12 bits) for its
+small character transformer on the same split (quoted from memory; verify).
+Longer contiguous contexts stop helping after six bytes because they are
+rarely seen. The model then cannot see informative bytes further back:
+for `the King of `, a limit-6 context sees only `ng of ` and predicts `t`
+(0.32), not the `E`/`N` of England and Naples. Masked and distant evidence
+must show its value as a reduction of this number.
 
 ### Exact hits can be weak evidence
 
@@ -161,18 +191,19 @@ main research question.
 
 ## Next considered steps
 
-1. Add exact `cooccur(A, B, d)` queries for multi-token `B`, using the current
-   occurrence index. Generate candidate `B` sequences from observed matches;
-   do not enumerate every possible sequence. Test the joint-count behavior on
-   a small corpus where single-offset marginals are deliberately identical.
+1. **Done (4 October 2026).** Exact `cooccur(A, B, d)` queries for masked
+   multi-token `B`, plus `events` to generate candidate blocks from observed
+   matches. Masked event *shapes* in `events` (for example, tallying the
+   bytes at offsets 1 and 3 together) are not implemented yet.
 2. Make an exploratory report comparing character-block signatures for
    `queen of `, `king of `, and control contexts. Try several block lengths
    and offsets. Decide how to avoid counting nested prefixes (`e`, `en`,
    `eng`, `engl`) as independent evidence.
-3. Build a transparent next-character baseline using exact suffix backoff and
-   smoothing, then add masked and distant evidence. Print the evidence table
-   with each prediction. Choose smoothing and combination weights using
-   held-out log loss, not by inspecting a few attractive examples.
+3. **Baseline done (4 October 2026):** contiguous-suffix Kneser–Ney with an
+   evidence table, scored at 2.1887 held-out bits per byte. Next, add masked
+   and distant evidence. Each pattern should contribute its change relative
+   to weaker parent patterns, with weights fitted on held-out log loss, not
+   chosen by inspecting a few attractive examples.
 4. Mine promising patterns starting with spans up to 8 and a provisional
    distance cap, perhaps 1,000. Use support, parent-relative distribution
    change, and held-out improvement to prune. A 16-position maximum and

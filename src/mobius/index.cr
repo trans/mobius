@@ -1,13 +1,15 @@
 module Mobius
   # A pattern uses * for one ignored byte. Leading ignored positions carry no
-  # information; trailing ones become additional target distance.
+  # information; trailing ones become additional target distance. As an event,
+  # a pattern's leading ignored positions instead delay its first literal.
   class Pattern
     MAX_SPAN = 16
 
     getter symbols : Array(UInt8?)
     getter trailing_skips : Int32
+    getter leading_skips : Int32
 
-    def initialize(@symbols : Array(UInt8?), @trailing_skips : Int32 = 0)
+    def initialize(@symbols : Array(UInt8?), @trailing_skips : Int32 = 0, @leading_skips : Int32 = 0)
     end
 
     def self.parse(text : String, max_span : Int32 = MAX_SPAN) : Pattern
@@ -42,8 +44,10 @@ module Mobius
       end
 
       raise ArgumentError.new("pattern must have 1 to #{max_span} positions") if symbols.empty? || symbols.size > max_span
+      leading = 0
       while !symbols.empty? && symbols.first?.nil?
         symbols.shift
+        leading += 1
       end
       trailing = 0
       while !symbols.empty? && symbols.last?.nil?
@@ -51,7 +55,7 @@ module Mobius
         trailing += 1
       end
       raise ArgumentError.new("pattern must contain at least one literal byte") if symbols.empty?
-      new(symbols, trailing)
+      new(symbols, trailing, leading)
     end
 
     def span : Int32
@@ -99,6 +103,38 @@ module Mobius
         ranked << {byte.to_u8, count} if count > 0
       end
       ranked.sort_by! { |entry| {-entry[1], entry[0]} }
+      ranked.first(limit)
+    end
+  end
+
+  # Support counts context matches whose whole event window lies inside the
+  # corpus; joint counts those where the event pattern also matches.
+  class Cooccurrence
+    getter support : Int64
+    getter joint : Int64
+
+    def initialize(@support : Int64, @joint : Int64)
+    end
+
+    def probability : Float64
+      @support == 0 ? 0.0 : @joint.to_f / @support
+    end
+  end
+
+  # Observed contiguous blocks at one offset, keyed by their bytes.
+  class EventCounts
+    getter counts : Hash(Bytes, Int64)
+    getter support : Int64
+
+    def initialize(@counts : Hash(Bytes, Int64), @support : Int64)
+    end
+
+    def most_common(limit : Int32 = 20) : Array(Tuple(Bytes, Int64))
+      ranked = @counts.to_a
+      ranked.sort! do |a, b|
+        order = b[1] <=> a[1]
+        order != 0 ? order : a[0] <=> b[0]
+      end
       ranked.first(limit)
     end
   end
@@ -246,6 +282,44 @@ module Mobius
 
     def query(pattern : Pattern, distance : Int32) : Histogram
       histogram(matching_end_positions(pattern), pattern.distance_from_last_literal(distance))
+    end
+
+    # Counts context matches followed by the event pattern starting `distance`
+    # positions after the context as typed. A one-byte event reproduces `query`.
+    def cooccur(context : Pattern, event : Pattern, distance : Int32) : Cooccurrence
+      first = context.distance_from_last_literal(distance).to_i64 + event.leading_skips
+      limit = @corpus_size.to_i64 - first - event.span
+      support = 0_i64
+      joint = 0_i64
+      matching_end_positions(context).each do |position|
+        break if position > limit
+        support += 1
+        joint += 1 if matches_at?(event, position + first)
+      end
+      Cooccurrence.new(support, joint)
+    end
+
+    # Tallies only the blocks that occur after context matches, so candidate
+    # events come from the corpus rather than from every possible sequence.
+    def events(context : Pattern, distance : Int32, length : Int32) : EventCounts
+      raise ArgumentError.new("event length must be at least 1") if length < 1
+      first = context.distance_from_last_literal(distance).to_i64
+      limit = @corpus_size.to_i64 - first - length
+      counts = Hash(Bytes, Int64).new(0_i64)
+      support = 0_i64
+      matching_end_positions(context).each do |position|
+        break if position > limit
+        counts[@corpus[position + first, length]] += 1
+        support += 1
+      end
+      EventCounts.new(counts, support)
+    end
+
+    private def matches_at?(pattern : Pattern, start : Int64) : Bool
+      pattern.symbols.each_with_index do |symbol, slot|
+        return false if symbol && @corpus[start + slot] != symbol
+      end
+      true
     end
 
     def self.require_little_endian : Nil
