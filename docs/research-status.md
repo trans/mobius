@@ -57,7 +57,12 @@ previous distance, and the most common target byte. `cooccur` implements
 contiguous blocks of one length at distance `d`, so candidate `B` sequences
 come from the corpus instead of from enumeration. `baseline` and `predict`
 implement the contiguous-suffix Kneser–Ney control described below, using a
-suffix array over the training text
+suffix array over the training text. `interactions` and `residual` mine
+masked patterns that reach beyond the Kneser–Ney context and add them to it
+([`src/mobius/interactions.cr`](../src/mobius/interactions.cr),
+[`src/mobius/residual.cr`](../src/mobius/residual.cr), sharing
+[`src/mobius/pattern_space.cr`](../src/mobius/pattern_space.cr)); both are
+described under the observations below
 ([`src/mobius/kneser_ney.cr`](../src/mobius/kneser_ney.cr),
 [`src/mobius/suffix_array.cr`](../src/mobius/suffix_array.cr)). The index format is versioned and currently requires
 a little-endian machine. [`spec/mobius_spec.cr`](../spec/mobius_spec.cr) covers
@@ -110,6 +115,43 @@ rarely seen. The model then cannot see informative bytes further back:
 for `the King of `, a limit-6 context sees only `ng of ` and predicts `t`
 (0.32), not the `E`/`N` of England and Naples. Masked and distant evidence
 must show its value as a reduction of this number.
+
+### A truncated Möbius sum double counts
+
+`interactions` mines patterns of up to 3 positions in a 16-byte window that
+reach beyond the 6-byte Kneser–Ney context. It ranks them by bits saved over
+their weakest parent and adds the Möbius terms of their subsets beyond
+offset 6 to the Kneser–Ney log-probability. Every added pattern made held-out
+loss worse: 2.1523 bits with none, 2.1542 with one, 2.2347 with 100, and
+about 3.97 with 10,000 (sampled). The top pattern, a newline 7 bytes back, is
+learned against plain byte frequencies (`I` 3.4×, `:` 3.8×), but at its
+matches Kneser–Ney is already nearly right (`I` 0.054 expected, 0.058
+actual), so the boost is counted twice. The dropped terms, interactions
+between the far position and the whole near context, are large and negative,
+and truncation sets them to zero.
+
+### Patterns judged against Kneser–Ney help a little
+
+`residual` judges each pattern by what Kneser–Ney gets wrong at its training
+matches: actual next-byte counts a_x against the counts e_x that a
+cross-fitted Kneser–Ney expected there (10 folds, each predicted by a model
+trained on the others), with correction ratio (a_x + 1)/(e_x + 1). Patterns
+with identical match sets are kept once.
+
+| Folds | Development (best match only) | Held-out test |
+| --- | ---: | ---: |
+| Contiguous | −0.0013 bits | 2.1887 → 2.1845 (−0.0042) |
+| Interleaved 1,000-byte blocks | −0.0042 bits | 2.1887 → 2.1845 (−0.0042) |
+
+Contiguous folds leave each model blind to names local to a play, so the top
+patterns compensate for that (`KING ******` predicting the `X` of `LEWIS XI`
+at 14,546× before the smoothing fix). Interleaved folds remove those; the top
+patterns are then line position (newline 7–13 bytes back: `.`, `?`, `;` 3–10×
+less likely). Multiplying in every matching pattern still fails (+1.05 bits at
+10,000 patterns; 26–70 patterns match per byte) because different patterns
+make the same correction at the same positions. Only the best-ranked match is
+used in the results above. A first version smoothed ratios with Witten–Bell,
+which drives unseen bytes to d/(S + d) and produced infinite losses.
 
 ### Exact hits can be weak evidence
 
@@ -200,10 +242,12 @@ main research question.
    and offsets. Decide how to avoid counting nested prefixes (`e`, `en`,
    `eng`, `engl`) as independent evidence.
 3. **Baseline done (4 October 2026):** contiguous-suffix Kneser–Ney with an
-   evidence table, scored at 2.1887 held-out bits per byte. Next, add masked
-   and distant evidence. Each pattern should contribute its change relative
-   to weaker parent patterns, with weights fitted on held-out log loss, not
-   chosen by inspecting a few attractive examples.
+   evidence table, scored at 2.1887 held-out bits per byte. Masked patterns
+   judged against it give 2.1845 (see the observations). Combining
+   overlapping patterns needs greedy refitting, each batch measured against
+   the model that already includes earlier ones. The largest observed miss
+   is recency (`DUKE VINCENTIO` in the development text: 4.4% actual, 1.2%
+   predicted), which no 16-byte window can see.
 4. Mine promising patterns starting with spans up to 8 and a provisional
    distance cap, perhaps 1,000. Use support, parent-relative distribution
    change, and held-out improvement to prune. A 16-position maximum and

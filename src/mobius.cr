@@ -1,5 +1,7 @@
 require "./mobius/index"
 require "./mobius/kneser_ney"
+require "./mobius/interactions"
+require "./mobius/residual"
 
 module Mobius
   USAGE = <<-TEXT
@@ -11,6 +13,10 @@ module Mobius
     mobius events <index.midx> <context> <length> <distance> [limit]
     mobius baseline <corpus.txt> [max-context]
     mobius predict <corpus.txt> <context> <context-limit> [candidates]
+    mobius interactions <corpus.txt> [window=16] [order=3] [support=10]
+                        [limit=6] [keep=100000] [stride=10]
+    mobius residual <corpus.txt> [window=16] [order=3] [support=10]
+                    [limit=6] [keep=100000] [folds=10] [interleave=0] [stride=1]
 
   Pattern syntax: * ignores one byte; \\* matches a literal *, and
   \\n, \\r, \\t, \\xHH encode literal bytes. Distance 1 is the next byte.
@@ -23,6 +29,18 @@ module Mobius
   context limit (0 to max-context, default 16) on the last 10% of the rest,
   then reports bits per byte on the held-out text. `predict` shows the
   evidence for one context, with counts from the first 90%.
+
+  `interactions` mines patterns of up to `order` positions in the last
+  `window` bytes that reach beyond the Kneser–Ney context `limit`, keeps the
+  `keep` best by bits saved over their parents, and adds the Möbius terms of
+  matching patterns to Kneser–Ney. It chooses how many patterns to use on the
+  development text, then scores every `stride`-th held-out byte.
+
+  `residual` instead scores each pattern by what Kneser–Ney gets wrong at its
+  training matches, using Kneser–Ney cross-fitted over `folds` folds
+  (contiguous, or blocks of `interleave` bytes dealt in turn), and
+  multiplies Kneser–Ney by the matching patterns' correction ratios. It
+  compares using every matching pattern with using only the best-ranked one.
   TEXT
 
   def self.display_byte(byte : UInt8) : String
@@ -79,6 +97,120 @@ module Mobius
     value = text.to_i?
     raise ArgumentError.new("expected a positive integer, got #{text.inspect}") unless value && value > 0
     value
+  end
+
+  def self.interactions(args : Array(String)) : Nil
+    raise ArgumentError.new(USAGE) if args.empty?
+    corpus = File.read(args.shift).to_slice
+    options = {"window" => 16, "order" => 3, "support" => 10, "limit" => 6, "keep" => 100_000, "stride" => 10}
+    args.each do |arg|
+      name, _, value = arg.partition('=')
+      raise ArgumentError.new("unknown option #{name.inspect}") unless options.has_key?(name)
+      options[name] = value.to_i? || raise ArgumentError.new("option #{name} needs an integer")
+    end
+    keep = options["keep"]
+    test_start = training_end(corpus.size)
+    dev_start = training_end(test_start)
+    started = Time.instant
+    model = InteractionModel.new(corpus[0, dev_start], options["window"], options["order"], options["support"], options["limit"], keep)
+    puts "options: #{options.map { |name, value| "#{name}=#{value}" }.join(' ')}"
+    puts "mined on [0,#{dev_start}): candidates=#{model.candidates} kept=#{model.ranked.size} seconds=#{(Time.instant - started).total_seconds.round(1)}"
+    puts "rank\tpattern\tsupport\tscore_bits\ttop_next"
+    model.ranked.first(20).each_with_index do |pattern, rank|
+      top = pattern.counts.each_with_index.to_a.sort_by { |count, slot| {-count, slot} }.first(3)
+      next_text = top.map { |count, slot| "#{display_byte(model.alphabet[slot])}:#{(count / pattern.support).round(2)}" }.join(' ')
+      puts "#{rank + 1}\t\"#{model.display(pattern.shape, pattern.key)}\"\t#{pattern.support}\t#{pattern.score.round(1)}\t#{next_text}"
+    end
+    actives = ([0, 100, 1_000, 10_000, 100_000].select { |count| count < model.ranked.size } << model.ranked.size).uniq
+    evaluate = ->(scoring : InteractionModel, start : Int32, finish : Int32, counts : Array(Int32)) do
+      bits = Array(Float64).new(counts.size, 0.0)
+      matched = Array(Int64).new(counts.size, 0_i64)
+      positions = (start...finish).step(options["stride"]).to_a
+      positions.each do |position|
+        base = scoring.base_scores(corpus, position)
+        counts.each_with_index do |active, i|
+          scores = scoring.log_scores(corpus, position, active, base)
+          bits[i] -= Math.log2(scoring.probability(scores, corpus[position]))
+          matched[i] += scoring.matching(corpus, position, active).size
+        end
+      end
+      {bits.map { |sum| sum / positions.size }, matched.map { |sum| sum / positions.size }, positions.size}
+    end
+    started = Time.instant
+    dev_bits, dev_matched, sampled = evaluate.call(model, dev_start, test_start, actives)
+    puts "development: every #{options["stride"]}th byte of [#{dev_start},#{test_start}), #{sampled} bytes, seconds=#{(Time.instant - started).total_seconds.round(1)}"
+    puts "patterns\tmatched_per_byte\tbits_per_byte\tchange_vs_kneser_ney"
+    actives.each_with_index do |active, i|
+      puts "#{active}\t#{dev_matched[i].round(1)}\t#{dev_bits[i].round(4)}\t#{(dev_bits[i] - dev_bits[0]).round(4)}"
+    end
+    best = actives[(0...actives.size).min_by { |i| dev_bits[i] }]
+    final = InteractionModel.new(corpus[0, test_start], options["window"], options["order"], options["support"], options["limit"], Math.max(best, 1))
+    test_bits, test_matched, sampled = evaluate.call(final, test_start, corpus.size, [0, best].uniq)
+    puts "test: every #{options["stride"]}th byte of [#{test_start},#{corpus.size}), #{sampled} bytes, mined on [0,#{test_start})"
+    puts "kneser_ney_bits_per_byte=#{test_bits[0].round(4)}"
+    puts "with_#{best}_patterns_bits_per_byte=#{test_bits.last.round(4)} change=#{(test_bits.last - test_bits[0]).round(4)} matched_per_byte=#{test_matched.last.round(1)}"
+  end
+
+  def self.residual(args : Array(String)) : Nil
+    raise ArgumentError.new(USAGE) if args.empty?
+    corpus = File.read(args.shift).to_slice
+    options = {"window" => 16, "order" => 3, "support" => 10, "limit" => 6, "keep" => 100_000, "folds" => 10, "interleave" => 0, "stride" => 1}
+    args.each do |arg|
+      name, _, value = arg.partition('=')
+      raise ArgumentError.new("unknown option #{name.inspect}") unless options.has_key?(name)
+      options[name] = value.to_i? || raise ArgumentError.new("option #{name} needs an integer")
+    end
+    test_start = training_end(corpus.size)
+    dev_start = training_end(test_start)
+    build = ->(text : Bytes, keep : Int32) do
+      ResidualModel.new(text, options["window"], options["order"], options["support"], options["limit"], options["folds"], options["interleave"], keep)
+    end
+    # Mean bits per byte for each pattern count, using all matches and the best one.
+    evaluate = ->(model : ResidualModel, start : Int32, finish : Int32, counts : Array(Int32)) do
+      every = Array(Float64).new(counts.size, 0.0)
+      single = Array(Float64).new(counts.size, 0.0)
+      matched = Array(Float64).new(counts.size, 0.0)
+      positions = (start...finish).step(options["stride"]).to_a
+      positions.each do |position|
+        base = model.base_scores(corpus, position)
+        ranks = model.matching(corpus, position, counts.max)
+        counts.each_with_index do |active, i|
+          used = ranks.select { |rank| rank < active }
+          every[i] -= Math.log2(model.probability(model.log_scores(used, false, base), corpus[position]))
+          single[i] -= Math.log2(model.probability(model.log_scores(used, true, base), corpus[position]))
+          matched[i] += used.size
+        end
+      end
+      {every.map { |sum| sum / positions.size }, single.map { |sum| sum / positions.size }, matched.map { |sum| sum / positions.size }, positions.size}
+    end
+
+    started = Time.instant
+    model = build.call(corpus[0, dev_start], options["keep"])
+    puts "options: #{options.map { |name, value| "#{name}=#{value}" }.join(' ')}"
+    puts "mined on [0,#{dev_start}): candidates=#{model.candidates} kept=#{model.ranked.size} seconds=#{(Time.instant - started).total_seconds.round(1)}"
+    puts "rank\tpattern\tsupport\tscore_bits\tlargest_corrections"
+    model.ranked.first(25).each_with_index do |pattern, rank|
+      slots = (0...model.alphabet.size).to_a.sort_by { |slot| -pattern.log_ratios[slot].abs }.first(3)
+      corrections = slots.map { |slot| "#{display_byte(model.alphabet[slot])}×#{Math.exp(pattern.log_ratios[slot]).round(2)}" }.join(' ')
+      puts "#{rank + 1}\t\"#{model.display(pattern.shape, pattern.key)}\"\t#{pattern.support}\t#{pattern.score.round(1)}\t#{corrections}"
+    end
+    actives = ([0, 10, 100, 1_000, 10_000, 100_000].select { |count| count < model.ranked.size } << model.ranked.size).uniq
+    started = Time.instant
+    every, single, matched, sampled = evaluate.call(model, dev_start, test_start, actives)
+    puts "development: every #{options["stride"]}th byte of [#{dev_start},#{test_start}), #{sampled} bytes, seconds=#{(Time.instant - started).total_seconds.round(1)}"
+    puts "patterns\tmatched_per_byte\tall_matches_bits\tchange\tbest_match_bits\tchange"
+    actives.each_with_index do |active, i|
+      puts "#{active}\t#{matched[i].round(1)}\t#{every[i].round(4)}\t#{(every[i] - every[0]).round(4)}\t#{single[i].round(4)}\t#{(single[i] - single[0]).round(4)}"
+    end
+    choices = actives.each_index.flat_map { |i| [{every[i], actives[i], false}, {single[i], actives[i], true}] }
+    _, chosen, best_only = choices.min_by { |choice| {choice[0], choice[1]} }
+    rule = best_only ? "best match" : "all matches"
+    final = build.call(corpus[0, test_start], Math.max(chosen, 1))
+    every, single, matched, sampled = evaluate.call(final, test_start, corpus.size, [0, chosen].uniq)
+    result = best_only ? single.last : every.last
+    puts "test: every #{options["stride"]}th byte of [#{test_start},#{corpus.size}), #{sampled} bytes, mined on [0,#{test_start}), #{chosen} patterns, #{rule}"
+    puts "kneser_ney_bits_per_byte=#{every[0].round(4)}"
+    puts "with_patterns_bits_per_byte=#{result.round(4)} change=#{(result - every[0]).round(4)} matched_per_byte=#{matched.last.round(1)}"
   end
 
   def self.run(args : Array(String)) : Nil
@@ -193,6 +325,10 @@ module Mobius
       ranked.first(shown).each do |byte, probability|
         puts "#{display_byte(byte)}\t#{probability.round(6)}\t#{levels.last.raw_count(byte)}"
       end
+    when "interactions"
+      interactions(args)
+    when "residual"
+      residual(args)
     when "help", "--help", "-h"
       puts USAGE
     else

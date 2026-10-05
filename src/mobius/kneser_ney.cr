@@ -46,6 +46,15 @@ module Mobius
       count = continuation_count(byte)
       (count - self.class.discount(count, @continuation_discounts)) / @continuation_total
     end
+
+    # The discounted share of the i-th observed byte, raw or continuation.
+    def term_at(i : Int32, raw : Bool) : Float64
+      if raw
+        (@raw[i] - self.class.discount(@raw[i], @raw_discounts)) / @raw_total
+      else
+        (@continuation[i] - self.class.discount(@continuation[i], @continuation_discounts)) / @continuation_total
+      end
+    end
   end
 
   # Interpolated modified Kneser–Ney over contiguous contexts (Chen and
@@ -111,6 +120,20 @@ module Mobius
           chain.last? || 1.0 / VOCABULARY
         end
       end
+    end
+
+    # The whole next-byte distribution under one context limit, equal byte for
+    # byte to `probabilities(levels, byte)[limit]`.
+    def distribution(levels : Array(KneserNeyLevel), limit : Int32 = @max_context) : Slice(Float64)
+      result = Slice(Float64).new(VOCABULARY, 1.0 / VOCABULARY)
+      levels.each do |level|
+        break if level.context_length > limit
+        raw = level.context_length == limit
+        backoff = raw ? level.raw_backoff : level.continuation_backoff
+        result.map! { |p| backoff * p }
+        level.bytes.each_with_index { |byte, i| result[byte] += level.term_at(i, raw) }
+      end
+      result
     end
 
     def probability(history : Bytes, byte : UInt8, limit : Int32 = @max_context) : Float64
