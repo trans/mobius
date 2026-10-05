@@ -146,11 +146,11 @@ module Mobius
 
     getter corpus_size : Int32
     getter alphabet : Bytes
+    getter corpus : Bytes
+    getter word_count : Int32
 
-    @corpus : Bytes
     @planes : Slice(UInt64)
     @lookup : StaticArray(Int32, 256)
-    @word_count : Int32
 
     private def initialize(@corpus : Bytes, @alphabet : Bytes, @planes : Slice(UInt64))
       @corpus_size = @corpus.size
@@ -224,6 +224,41 @@ module Mobius
 
     def bitplane_bytes : Int64
       @planes.bytesize.to_i64
+    end
+
+    # Every position: a match set before any byte is required.
+    def full_set : Slice(UInt64)
+      set = Slice(UInt64).new(@word_count, UInt64::MAX)
+      if (tail = @corpus_size % 64) != 0
+        set[@word_count - 1] = (1_u64 << tail) - 1_u64
+      end
+      set
+    end
+
+    # Writes to `target` the positions of `source` whose byte `offset` places
+    # earlier is `byte`, and returns how many there are.
+    def restrict(source : Slice(UInt64), target : Slice(UInt64), byte : UInt8, offset : Int32) : Int32
+      plane = @lookup[byte.to_i]
+      if plane < 0
+        target.fill(0_u64)
+        return 0
+      end
+      whole = offset // 64
+      remainder = offset % 64
+      base = plane * @word_count
+      count = 0
+      @word_count.times do |word|
+        from = word - whole
+        aligned = 0_u64
+        if from >= 0
+          aligned = @planes[base + from] << remainder
+          aligned |= @planes[base + from - 1] >> (64 - remainder) if remainder > 0 && from > 0
+        end
+        bits = source[word] & aligned
+        target[word] = bits
+        count += bits.popcount
+      end
+      count
     end
 
     # Returns corpus positions where the last specified pattern byte occurs.

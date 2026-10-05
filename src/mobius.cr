@@ -2,6 +2,9 @@ require "./mobius/index"
 require "./mobius/kneser_ney"
 require "./mobius/interactions"
 require "./mobius/residual"
+require "./mobius/recency"
+require "./mobius/lattice"
+require "./mobius/sufficiency"
 
 module Mobius
   USAGE = <<-TEXT
@@ -17,6 +20,11 @@ module Mobius
                         [limit=6] [keep=100000] [stride=10]
     mobius residual <corpus.txt> [window=16] [order=3] [support=10]
                     [limit=6] [keep=100000] [folds=10] [interleave=0] [stride=1]
+    mobius recency <corpus.txt> [limit=6] [context=7] [spans=500,2000,10000,50000]
+    mobius lattice <corpus.txt> [window=16] [k=1,4,16,64] [support=2,5,10,25] [stride=20]
+    mobius neighbors <corpus.txt> <context> [window=16] [k=16] [support=2]
+    mobius sufficiency <corpus.txt> [window=16] [support=2,10] [prior=0.5,2,8] [stride=100] [suffixes]
+    mobius sufficient <corpus.txt> <context> [window=16] [support=2] [prior=2] [suffixes]
 
   Pattern syntax: * ignores one byte; \\* matches a literal *, and
   \\n, \\r, \\t, \\xHH encode literal bytes. Distance 1 is the next byte.
@@ -41,6 +49,30 @@ module Mobius
   (contiguous, or blocks of `interleave` bytes dealt in turn), and
   multiplies Kneser–Ney by the matching patterns' correction ratios. It
   compares using every matching pattern with using only the best-ranked one.
+
+  `recency` mixes Kneser–Ney with a cache of what followed each recent context
+  (up to `context` bytes) within the last `span` bytes. The mixing weight
+  depends on the longest context the cache has seen; weights and span are
+  fitted on the development text, then applied unchanged to the test text.
+
+  `lattice` predicts from the masked patterns consistent with the last
+  `window` bytes, using exact counts from a bit-plane index over the training
+  text: each pattern's Witten–Bell estimate, weighted by how well it predicts
+  its own matches when each is left out, averaged over the `k` heaviest
+  patterns with at least `support` matches. It chooses `k` and `support` on
+  every `stride`-th development byte and scores the test text the same way,
+  with Kneser–Ney on the same bytes for reference. `neighbors` shows the kept
+  patterns for one context, with counts from the first 90%.
+
+  `sufficiency` weights each pattern by the posterior probability that
+  refinement stops there: from the empty pattern outward, a pattern passes its
+  weight to a refinement when matches that agree with the history at the
+  added offset continue differently from those that disagree. `prior` is the
+  Dirichlet concentration of every estimate (pseudo-counts toward the byte
+  frequencies). It chooses `support` and `prior` on the development text and
+  scores the test text the same way. `sufficient` shows the weights for one
+  context. With `suffixes`, patterns may only grow by the next older offset,
+  so only contiguous suffixes are used.
   TEXT
 
   def self.display_byte(byte : UInt8) : String
@@ -213,6 +245,251 @@ module Mobius
     puts "with_patterns_bits_per_byte=#{result.round(4)} change=#{(result - every[0]).round(4)} matched_per_byte=#{matched.last.round(1)}"
   end
 
+  def self.recency(args : Array(String)) : Nil
+    raise ArgumentError.new(USAGE) if args.empty?
+    corpus = File.read(args.shift).to_slice
+    options = {"limit" => 6, "context" => 7}
+    spans = [500, 2_000, 10_000, 50_000]
+    args.each do |arg|
+      name, _, value = arg.partition('=')
+      if name == "spans"
+        spans = value.split(',').map { |span| parse_positive(span) }
+      elsif options.has_key?(name)
+        options[name] = value.to_i? || raise ArgumentError.new("option #{name} needs an integer")
+      else
+        raise ArgumentError.new("unknown option #{name.inspect}")
+      end
+    end
+    limit = options["limit"]
+    context = options["context"]
+    buckets = context + 2
+    test_start = training_end(corpus.size)
+    dev_start = training_end(test_start)
+    # Each actual byte's probability under Kneser–Ney, and under the cache with
+    # its bucket (longest cached context + 1).
+    kneser_ney_for = ->(counts_end : Int32, start : Int32, finish : Int32) do
+      model = KneserNey.new(SuffixArray.new(corpus[0, counts_end]), limit)
+      (start...finish).map { |position| model.probability(corpus[0, position], corpus[position], limit) }
+    end
+    cache_for = ->(span : Int32, start : Int32, finish : Int32) do
+      cache = RecencyCache.new(corpus, span, context, start)
+      probabilities = [] of Float64
+      levels = [] of Int32
+      (start...finish).each do |position|
+        cache.advance(position)
+        probabilities << cache.probability(corpus[position])
+        levels << cache.longest + 1
+      end
+      {probabilities, levels}
+    end
+    mixed_bits = ->(kneser_ney : Array(Float64), cache : Array(Float64), levels : Array(Int32), weights : Array(Float64)) do
+      kneser_ney.each_index.sum { |i| -Math.log2(RecencyMixture.probability(kneser_ney[i], cache[i], weights[levels[i]])) } / kneser_ney.size
+    end
+
+    dev_kneser_ney = kneser_ney_for.call(dev_start, dev_start, test_start)
+    base_bits = dev_kneser_ney.sum { |p| -Math.log2(p) } / dev_kneser_ney.size
+    puts "options: limit=#{limit} context=#{context} spans=#{spans.join(',')}"
+    puts "development: [#{dev_start},#{test_start}), Kneser–Ney counts from [0,#{dev_start}), kneser_ney_bits_per_byte=#{base_bits.round(4)}"
+    puts "span\tbits_per_byte\tchange_vs_kneser_ney"
+    fitted = spans.map do |span|
+      cache, levels = cache_for.call(span, dev_start, test_start)
+      weights = RecencyMixture.fit(dev_kneser_ney, cache, levels, buckets)
+      bits = mixed_bits.call(dev_kneser_ney, cache, levels, weights)
+      puts "#{span}\t#{bits.round(4)}\t#{(bits - base_bits).round(4)}"
+      {span, weights, bits, cache, levels}
+    end
+    span, weights, _, cache, levels = fitted.min_by { |entry| entry[2] }
+    puts "chosen_span=#{span}"
+    puts "longest_cached_context\tdevelopment_bytes\tcache_weight"
+    buckets.times do |bucket|
+      puts "#{bucket - 1}\t#{levels.count(bucket)}\t#{weights[bucket].round(3)}"
+    end
+    puts "largest development gains (one per context and byte):"
+    puts "context\tnext\tkneser_ney_p\tcache_p\tmixed_p"
+    gains = dev_kneser_ney.each_index.map do |i|
+      mixed = RecencyMixture.probability(dev_kneser_ney[i], cache[i], weights[levels[i]])
+      {Math.log2(mixed / dev_kneser_ney[i]), i}
+    end.to_a.sort_by { |gain, _| -gain }
+    shown = Set(String).new
+    gains.each do |_, i|
+      break if shown.size >= 8
+      position = dev_start + i
+      label = display_bytes(corpus[position - 20, 20])
+      next unless shown.add?(label[-10..] + corpus[position].chr)
+      mixed = RecencyMixture.probability(dev_kneser_ney[i], cache[i], weights[levels[i]])
+      puts "#{label}\t#{display_byte(corpus[position])}\t#{dev_kneser_ney[i].round(4)}\t#{cache[i].round(4)}\t#{mixed.round(4)}"
+    end
+
+    test_kneser_ney = kneser_ney_for.call(test_start, test_start, corpus.size)
+    test_cache, test_levels = cache_for.call(span, test_start, corpus.size)
+    test_base = test_kneser_ney.sum { |p| -Math.log2(p) } / test_kneser_ney.size
+    test_bits = mixed_bits.call(test_kneser_ney, test_cache, test_levels, weights)
+    puts "test: [#{test_start},#{corpus.size}), Kneser–Ney counts from [0,#{test_start}), span and weights from development"
+    puts "kneser_ney_bits_per_byte=#{test_base.round(4)}"
+    puts "with_recency_bits_per_byte=#{test_bits.round(4)} change=#{(test_bits - test_base).round(4)}"
+  end
+
+  # Parses name=value options into integer lists, starting from defaults.
+  def self.list_options(args : Array(String), defaults : Hash(String, Array(Int32))) : Hash(String, Array(Int32))
+    options = defaults.dup
+    args.each do |arg|
+      name, _, value = arg.partition('=')
+      raise ArgumentError.new("unknown option #{name.inspect}") unless options.has_key?(name)
+      options[name] = value.split(',').map { |item| parse_positive(item) }
+    end
+    options
+  end
+
+  def self.lattice(args : Array(String)) : Nil
+    raise ArgumentError.new(USAGE) if args.empty?
+    corpus = File.read(args.shift).to_slice
+    options = list_options(args, {"window" => [16], "k" => [1, 4, 16, 64], "support" => [2, 5, 10, 25], "stride" => [20]})
+    window = options["window"].first
+    ks = options["k"].sort
+    stride = options["stride"].first
+    test_start = training_end(corpus.size)
+    dev_start = training_end(test_start)
+    # Mean bits per byte on every stride-th byte of [start, finish), for each k,
+    # with counts from [0, start); and Kneser–Ney on the same bytes.
+    score = ->(start : Int32, finish : Int32, support : Int32, counts : Array(Int32)) do
+      index = Index.from_bytes(corpus[0, start])
+      predictor = LatticePredictor.new(index, window, support, counts.max)
+      kneser_ney = KneserNey.new(SuffixArray.new(corpus[0, start]), 6)
+      positions = (start...finish).step(stride).to_a
+      bits = Array(Float64).new(counts.size, 0.0)
+      reference = 0.0
+      started = Time.instant
+      positions.each do |position|
+        history = corpus[0, position]
+        patterns = predictor.patterns(history)
+        counts.each_with_index { |k, i| bits[i] -= Math.log2(predictor.probability(patterns, corpus[position], k)) }
+        reference -= Math.log2(kneser_ney.probability(history, corpus[position], 6))
+      end
+      seconds = (Time.instant - started).total_seconds
+      {bits.map { |sum| sum / positions.size }, reference / positions.size, positions.size, seconds}
+    end
+
+    puts "options: window=#{window} k=#{ks.join(',')} support=#{options["support"].join(',')} stride=#{stride}"
+    puts "development: every #{stride}th byte of [#{dev_start},#{test_start}), counts from [0,#{dev_start})"
+    puts "support\t#{ks.map { |k| "k=#{k}" }.join('\t')}\tkneser_ney\tms_per_byte"
+    results = options["support"].map do |support|
+      bits, reference, sampled, seconds = score.call(dev_start, test_start, support, ks)
+      puts "#{support}\t#{bits.map(&.round(4)).join('\t')}\t#{reference.round(4)}\t#{(1000 * seconds / sampled).round(2)}"
+      {support, bits}
+    end
+    support, k, _ = results.flat_map { |s, bits| ks.each_with_index.map { |k, i| {s, k, bits[i]} }.to_a }.min_by { |entry| entry[2] }
+    bits, reference, sampled, _ = score.call(test_start, corpus.size, support, [k])
+    puts "test: every #{stride}th byte of [#{test_start},#{corpus.size}), #{sampled} bytes, counts from [0,#{test_start}), support=#{support} k=#{k}"
+    puts "kneser_ney_bits_per_byte=#{reference.round(4)}"
+    puts "lattice_bits_per_byte=#{bits[0].round(4)} change=#{(bits[0] - reference).round(4)}"
+  end
+
+  def self.neighbors(args : Array(String)) : Nil
+    raise ArgumentError.new(USAGE) if args.size < 2
+    corpus = File.read(args.shift).to_slice
+    history = literal_bytes(args.shift)
+    options = list_options(args, {"window" => [16], "k" => [16], "support" => [2]})
+    counts_end = training_end(corpus.size)
+    predictor = LatticePredictor.new(Index.from_bytes(corpus[0, counts_end]), options["window"].first, options["support"].first, options["k"].first)
+    patterns = predictor.patterns(history)
+    total = patterns.sum(&.weight)
+    puts "context=#{display_bytes(history)} counts_from=[0,#{counts_end}) window=#{options["window"].first} support>=#{options["support"].first}"
+    puts "rank\tpattern\tsupport\tloo_bits\tweight\tshare\ttop_next"
+    patterns.each_with_index do |pattern, rank|
+      top = (0...predictor.alphabet.size).to_a.sort_by { |slot| -pattern.counts[slot] }.first(3).select { |slot| pattern.counts[slot] > 0 }
+      next_text = top.map { |slot| "#{display_byte(predictor.alphabet[slot])}:#{pattern.counts[slot]}" }.join(' ')
+      puts "#{rank + 1}\t\"#{predictor.display(pattern.shape, history)}\"\t#{pattern.support}\t#{pattern.bits.round(3)}\t#{pattern.weight.round(3)}\t#{(pattern.weight / total).round(3)}\t#{next_text}"
+    end
+    distribution = predictor.distribution(patterns)
+    puts "next\tprobability"
+    (0..255).to_a.sort_by { |byte| -distribution[byte] }.first(8).each do |byte|
+      puts "#{display_byte(byte.to_u8)}\t#{distribution[byte].round(4)}"
+    end
+  end
+
+  # Splits off a name=list option of positive decimals.
+  def self.decimal_option(args : Array(String), name : String, default : Array(Float64)) : Array(Float64)
+    found = args.find { |arg| arg.starts_with?("#{name}=") }
+    return default unless found
+    args.delete(found)
+    found.partition('=')[2].split(',').map do |item|
+      value = item.to_f?
+      raise ArgumentError.new("#{name} needs positive numbers") unless value && value > 0
+      value
+    end
+  end
+
+  def self.sufficiency(args : Array(String)) : Nil
+    raise ArgumentError.new(USAGE) if args.empty?
+    corpus = File.read(args.shift).to_slice
+    priors = decimal_option(args, "prior", [0.5, 2.0, 8.0])
+    suffixes_only = !args.delete("suffixes").nil?
+    options = list_options(args, {"window" => [16], "support" => [2, 10], "stride" => [100]})
+    window = options["window"].first
+    stride = options["stride"].first
+    test_start = training_end(corpus.size)
+    dev_start = training_end(test_start)
+    # Mean bits per byte on every stride-th byte of [start, finish), counts from
+    # [0, start), with Kneser–Ney on the same bytes.
+    score = ->(start : Int32, finish : Int32, support : Int32, prior : Float64) do
+      predictor = SufficiencyPredictor.new(Index.from_bytes(corpus[0, start]), window, support, prior, suffixes_only: suffixes_only)
+      kneser_ney = KneserNey.new(SuffixArray.new(corpus[0, start]), 6)
+      positions = (start...finish).step(stride).to_a
+      bits = 0.0
+      reference = 0.0
+      started = Time.instant
+      positions.each do |position|
+        history = corpus[0, position]
+        bits -= Math.log2(predictor.probability(predictor.patterns(history), corpus[position]))
+        reference -= Math.log2(kneser_ney.probability(history, corpus[position], 6))
+      end
+      seconds = (Time.instant - started).total_seconds
+      {bits / positions.size, reference / positions.size, positions.size, seconds}
+    end
+
+    puts "options: window=#{window} support=#{options["support"].join(',')} prior=#{priors.join(',')} stride=#{stride}#{suffixes_only ? " suffixes" : ""}"
+    puts "development: every #{stride}th byte of [#{dev_start},#{test_start}), counts from [0,#{dev_start})"
+    puts "support\tprior\tbits_per_byte\tkneser_ney\tchange\tms_per_byte"
+    results = options["support"].flat_map do |support|
+      priors.map do |prior|
+        bits, reference, sampled, seconds = score.call(dev_start, test_start, support, prior)
+        puts "#{support}\t#{prior}\t#{bits.round(4)}\t#{reference.round(4)}\t#{(bits - reference).round(4)}\t#{(1000 * seconds / sampled).round(1)}"
+        {support, prior, bits}
+      end
+    end
+    support, prior, _ = results.min_by { |entry| entry[2] }
+    bits, reference, sampled, _ = score.call(test_start, corpus.size, support, prior)
+    puts "test: every #{stride}th byte of [#{test_start},#{corpus.size}), #{sampled} bytes, counts from [0,#{test_start}), support=#{support} prior=#{prior}"
+    puts "kneser_ney_bits_per_byte=#{reference.round(4)}"
+    puts "sufficiency_bits_per_byte=#{bits.round(4)} change=#{(bits - reference).round(4)}"
+  end
+
+  def self.sufficient(args : Array(String)) : Nil
+    raise ArgumentError.new(USAGE) if args.size < 2
+    corpus = File.read(args.shift).to_slice
+    history = literal_bytes(args.shift)
+    prior = decimal_option(args, "prior", [2.0]).first
+    suffixes_only = !args.delete("suffixes").nil?
+    options = list_options(args, {"window" => [16], "support" => [2]})
+    counts_end = training_end(corpus.size)
+    predictor = SufficiencyPredictor.new(Index.from_bytes(corpus[0, counts_end]), options["window"].first, options["support"].first, prior,
+      suffixes_only: suffixes_only)
+    patterns = predictor.patterns(history)
+    puts "context=#{display_bytes(history)} counts_from=[0,#{counts_end}) window=#{options["window"].first} support>=#{options["support"].first} prior=#{prior}"
+    puts "patterns_with_weight=#{patterns.size}"
+    puts "rank\tpattern\tsupport\tweight\ttop_next"
+    patterns.first(12).each_with_index do |pattern, rank|
+      top = (0...predictor.alphabet.size).to_a.sort_by { |slot| -pattern.counts[slot] }.first(4).select { |slot| pattern.counts[slot] > 0 }
+      next_text = top.map { |slot| "#{display_byte(predictor.alphabet[slot])}:#{pattern.counts[slot]}" }.join(' ')
+      puts "#{rank + 1}\t\"#{predictor.display(pattern.shape, history)}\"\t#{pattern.support}\t#{pattern.weight.round(4)}\t#{next_text}"
+    end
+    distribution = predictor.distribution(patterns)
+    puts "next\tprobability"
+    (0..255).to_a.sort_by { |byte| -distribution[byte] }.first(8).each do |byte|
+      puts "#{display_byte(byte.to_u8)}\t#{distribution[byte].round(4)}"
+    end
+  end
+
   def self.run(args : Array(String)) : Nil
     command = args.shift?
     case command
@@ -329,6 +606,16 @@ module Mobius
       interactions(args)
     when "residual"
       residual(args)
+    when "recency"
+      recency(args)
+    when "lattice"
+      lattice(args)
+    when "neighbors"
+      neighbors(args)
+    when "sufficiency"
+      sufficiency(args)
+    when "sufficient"
+      sufficient(args)
     when "help", "--help", "-h"
       puts USAGE
     else

@@ -71,6 +71,16 @@ describe Mobius::SuffixArray do
 end
 
 describe Mobius::KneserNey do
+  it "computes Chen and Goodman's discounts from count-of-counts" do
+    # n1..n4 = 100, 40, 20, 10: Y = 100 / 180, then D_r = r - (r + 1) Y n_{r+1} / n_r.
+    n = StaticArray[0_i64, 100_i64, 40_i64, 20_i64, 10_i64]
+    y = 100.0 / 180.0
+    discounts = Mobius::KneserNey.discounts(n)
+    discounts[0].should be_close(1 - 2 * y * 40 / 100, 1e-12)
+    discounts[1].should be_close(2 - 3 * y * 20 / 40, 1e-12)
+    discounts[2].should be_close(3 - 4 * y * 10 / 20, 1e-12)
+  end
+
   corpus = begin
     random = Random.new(11)
     String.build { |io| 400.times { io << "abc d."[random.rand(6)] } }.to_slice
