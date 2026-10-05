@@ -82,3 +82,28 @@ many bits per byte can far patterns (presence within the last D bytes, beyond
 the 16-byte window) carry about the next byte given the near context, measured
 against cross-fitted Kneser–Ney? A large number justifies the predictor; a
 small one says the long-range information lies elsewhere.
+
+## 2026-10-05: relations are range-weighted, not fixed-offset
+
+Every pattern so far fixes its offsets: "this byte exactly k positions back".
+Real dependencies have no fixed distance. If "Mary" is said and "she" follows
+later, they are correlated whether 3 or 30 tokens apart; the strength of the
+correlation falls with distance; and an intervening "Elizabeth" breaks it,
+pinning "she" to Elizabeth instead. A fixed-offset pattern can only catch such
+a relation where the distance happens to repeat, which may explain why masked
+patterns find regularities in the training text that do not carry over to new
+text ([nested-mask-prior](../nested-mask-prior/)).
+
+This sharpens what a combinator should be:
+
+- **p1 occurs within a range, weighted by recency**, not at an exact gap: the
+  most recent occurrence counts most, and the weight decays with distance.
+- **Interference is part of the relation.** The effect of p1 on the target
+  given p2 holds only if no competing p1′ (another name) occurs in between.
+  This is the transitive structure: p1 → (no intervening p1′) → p2 → target.
+- The bit planes support this directly: a match set for p1 can be spread
+  forward over a range (OR of shifts, or a running "most recent occurrence"
+  distance), and a competing pattern's matches can cut the spread off.
+
+In neural terms this is what attention with recency bias does, and what
+induction heads do for copying. Here it would be explicit and countable.

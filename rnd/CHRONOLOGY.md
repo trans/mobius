@@ -16,3 +16,4 @@ The order in which the experiments under `rnd/` were tried. Each directory's
 | 9 | 2026-10-05 | [discounted-sufficiency](discounted-sufficiency/) | Negative: Pitman–Yor estimates worse; Kneser–Ney's edge is continuation counts (0.25 bits). |
 | 10 | 2026-10-05 | [continuation-sufficiency](continuation-sufficiency/) | Ties Kneser–Ney with suffixes only (+0.0011 ± 0.0028 on held-back bytes). Masks still worse. |
 | 11 | 2026-10-05 | [nested-mask-prior](nested-mask-prior/) | Negative: even at 1% prior, training evidence pulls masks in, and they cost 0.64 bits where they take over. |
+| 12 | 2026-10-05 | [cross-fitted-evidence](cross-fitted-evidence/) | Negative: judging refinements on held-out training folds does not keep masks out (+0.156). |

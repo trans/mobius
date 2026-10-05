@@ -72,6 +72,25 @@ module Mobius
       result
     end
 
+    # For the pattern at `depth` of the current walk: its next-byte counts by
+    # slot, separately for each of `folds` contiguous blocks of the text.
+    def fold_counts(depth : Int32, folds : Int32) : Array(Slice(Int32))
+      corpus = @index.corpus
+      size = corpus.size.to_i64
+      result = Array(Slice(Int32)).new(folds) { Slice(Int32).new(@alphabet.size, 0) }
+      each_position(depth) do |position|
+        result[(position.to_i64 * folds // size).to_i32][@slots[corpus[position].to_i]] += 1
+      end
+      result
+    end
+
+    # Fold counts of the empty pattern, which match every position.
+    def empty_fold_counts(folds : Int32) : Array(Slice(Int32))
+      @sets[0] = @full
+      @as_set[0] = true
+      fold_counts(0, folds)
+    end
+
     # Continuation counts of the empty pattern, which match every position.
     def empty_continuation_counts(offset : Int32) : Slice(Int32)
       @sets[0] = @full

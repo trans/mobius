@@ -61,6 +61,13 @@ module Mobius
   # enough support goes to stopping. With p = 1 the model is exactly the
   # suffix model.
   #
+  # With `folds` K, evidence is cross-validated instead of a marginal
+  # likelihood (a pseudo-Bayes factor): the training text is cut into K
+  # contiguous blocks, and each block's matches are predicted from the other
+  # blocks' counts with the same prior mean,
+  #   Σ_f Σ_x c_f(x) · log[(c(x) − c_f(x) + β·m_x) / (n − n_f + β)].
+  # Prior means stay computed from all the text.
+  #
   # With a `discount` D, every estimate is a Pitman–Yor posterior with one
   # table per distinct byte, strength θ = `concentration` and the same prior
   # mean m: P̂(x) = (max(c_x − D, 0) + (θ + D·d)·m_x) / (θ + n) for d distinct
@@ -81,17 +88,23 @@ module Mobius
     getter discount : Float64?
     getter chain_strength : Float64?
     getter nearest_prior : Float64?
+    getter folds : Int32?
 
     delegate alphabet, unigram, display, window, to: @search
 
     @prior_log_gamma : Slice(Float64)
     @empty_continuations : Array(Slice(Int32))
+    @empty_folds : Array(Slice(Int32))
     @log_gamma_concentration : Float64
 
     def initialize(index : Index, window : Int32, @min_support : Int32, @concentration : Float64, @stop : Float64 = 0.5,
                    @suffixes_only : Bool = false, @hierarchical : Bool = false, @discount : Float64? = nil,
-                   @chain_strength : Float64? = nil, @nearest_prior : Float64? = nil)
+                   @chain_strength : Float64? = nil, @nearest_prior : Float64? = nil, @folds : Int32? = nil)
       raise ArgumentError.new("minimum support must be at least 1") if @min_support < 1
+      if folds = @folds
+        raise ArgumentError.new("cross-validation needs at least 2 folds") if folds < 2
+        raise ArgumentError.new("cross-validation is defined for Dirichlet estimates") if @discount
+      end
       if nearest = @nearest_prior
         raise ArgumentError.new("nearest-offset prior must be in (0, 1]") unless 0 < nearest <= 1
       end
@@ -110,6 +123,7 @@ module Mobius
       @empty_continuations = Array(Slice(Int32)).new(window + 1) do |offset|
         @chain_strength && offset > 0 ? @search.empty_continuation_counts(offset) : Slice(Int32).new(0)
       end
+      @empty_folds = (folds = @folds) ? @search.empty_fold_counts(folds) : [] of Slice(Int32)
       @prior_log_gamma = Slice(Float64).new(alphabet.size) { |slot| Math.lgamma(@concentration * unigram[slot]) }
       @log_gamma_concentration = Math.lgamma(@concentration)
     end
@@ -124,6 +138,24 @@ module Mobius
         total += Math.lgamma(count + @concentration * unigram[slot]) - @prior_log_gamma[slot]
       end
       total
+    end
+
+    # Cross-validated log-probability of matches split into folds: each fold
+    # predicted from the others' counts with a Dirichlet prior centered on `mean`.
+    def cross_validated_evidence(by_fold : Array(Slice(Int32)), mean : Slice(Float64)) : Float64
+      totals = Slice(Int32).new(alphabet.size) { |slot| by_fold.sum { |fold| fold[slot] } }
+      size = totals.sum
+      result = 0.0
+      by_fold.each do |fold|
+        held = fold.sum
+        next if held == 0
+        denominator = size - held + @concentration
+        fold.each_with_index do |count, slot|
+          next if count == 0
+          result += count * Math.log((totals[slot] - count + @concentration * mean[slot]) / denominator)
+        end
+      end
+      result
     end
 
     # The same, for a prior centered on `mean`: Dirichlet, or Pitman–Yor when
@@ -206,8 +238,10 @@ module Mobius
       counts = [] of Slice(Int32)
       found = {} of UInt32 => Int32
       limit = Math.min(window, history.size)
-      # Continuation counts of each pattern for the offsets its children add.
+      # Continuation counts of each pattern for the offsets its children add,
+      # and its counts by fold.
       continuations = [] of Hash(Int32, Slice(Int32))
+      by_fold = [] of Array(Slice(Int32))
       @search.each(history, @min_support) do |shape, support, next_counts, depth|
         next false if @suffixes_only && !suffix?(shape)
         found[shape] = shapes.size
@@ -221,6 +255,9 @@ module Mobius
           end
         end
         continuations << by_offset
+        if folds = @folds
+          by_fold << (shape == 0 ? @empty_folds : @search.fold_counts(depth, folds))
+        end
         true
       end
       size = shapes.size
@@ -263,7 +300,7 @@ module Mobius
       stop_share = Array(Float64).new(size, 1.0)
       refine_shares = Array(Array(Float64)).new(size) { [] of Float64 }
       order.each do |i|
-        evidence = evidence_of.call(counts[i], supports[i], i)
+        evidence = @folds ? cross_validated_evidence(by_fold[i], means[i]) : evidence_of.call(counts[i], supports[i], i)
         if children[i].empty?
           weighted[i] = evidence
           next
@@ -271,8 +308,16 @@ module Mobius
         shares, unused = refinement_shares(shapes[i], children[i].map { |child| shapes[child] }, limit)
         stop_term = Math.log(@stop + (1 - @stop) * unused) + evidence
         terms = children[i].map_with_index do |child, j|
-          rest = Slice(Int32).new(alphabet.size) { |slot| counts[i][slot] - counts[child][slot] }
-          Math.log(1 - @stop) + Math.log(shares[j]) + evidence_of.call(rest, supports[i] - supports[child], i) + weighted[child]
+          disagreeing = if @folds
+                          rest_by_fold = by_fold[i].map_with_index do |fold, f|
+                            Slice(Int32).new(alphabet.size) { |slot| fold[slot] - by_fold[child][f][slot] }
+                          end
+                          cross_validated_evidence(rest_by_fold, means[i])
+                        else
+                          rest = Slice(Int32).new(alphabet.size) { |slot| counts[i][slot] - counts[child][slot] }
+                          evidence_of.call(rest, supports[i] - supports[child], i)
+                        end
+          Math.log(1 - @stop) + Math.log(shares[j]) + disagreeing + weighted[child]
         end
         top = Math.max(stop_term, terms.max)
         total = top + Math.log(Math.exp(stop_term - top) + terms.sum { |term| Math.exp(term - top) })

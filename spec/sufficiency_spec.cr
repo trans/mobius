@@ -54,6 +54,28 @@ def pattern_evidence(counts : Array(Int32), mean : Indexable(Float64), predictor
   end
 end
 
+def sufficiency_fold_counts(training : Bytes, alphabet : Bytes, offsets : Array(Int32), history : Bytes, folds : Int32) : Array(Array(Int32))
+  result = Array.new(folds) { Array(Int32).new(alphabet.size, 0) }
+  training.size.times do |t|
+    next unless offsets.all? { |o| t - o >= 0 && training[t - o] == history[history.size - o] }
+    result[(t.to_i64 * folds // training.size).to_i][alphabet.index(training[t]).not_nil!] += 1
+  end
+  result
+end
+
+# Each fold's matches predicted from the sum of the other folds' counts.
+def naive_cross_validated(by_fold : Array(Array(Int32)), mean : Array(Float64), beta : Float64) : Float64
+  total = 0.0
+  by_fold.each_with_index do |fold, f|
+    others = Array(Int32).new(mean.size, 0)
+    by_fold.each_with_index { |other, g| other.each_with_index { |c, slot| others[slot] += c } unless g == f }
+    fold.each_with_index do |c, slot|
+      total += c * Math.log((others[slot] + beta * mean[slot]) / (others.sum + beta)) if c > 0
+    end
+  end
+  total
+end
+
 # The prior mean a pattern is judged against: plain frequency, or with
 # hierarchical priors the estimate of the pattern without its farthest offset.
 def sufficiency_mean(training : Bytes, predictor : Mobius::SufficiencyPredictor, history : Bytes, offsets : Array(Int32)) : Array(Float64)
@@ -104,7 +126,12 @@ def sufficiency_paths(training : Bytes, predictor : Mobius::SufficiencyPredictor
     sufficiency_counts(training, alphabet, (offsets + [o]).sort, history).sum >= predictor.min_support
   end
   mean = sufficiency_mean(training, predictor, history, offsets)
-  evidence = pattern_evidence(counts, mean, predictor)
+  folds = predictor.folds
+  evidence = if folds
+               naive_cross_validated(sufficiency_fold_counts(training, alphabet, offsets, history, folds), mean, predictor.concentration)
+             else
+               pattern_evidence(counts, mean, predictor)
+             end
   if refinements.empty?
     joint[offsets] += Math.exp(log_so_far + evidence)
   else
@@ -125,7 +152,15 @@ def sufficiency_paths(training : Bytes, predictor : Mobius::SufficiencyPredictor
                 1.0 / refinements.size
               end
       next if share == 0
-      step = Math.log(1 - predictor.stop) + Math.log(share) + pattern_evidence(rest, mean, predictor)
+      disagreeing = if folds
+                      whole = sufficiency_fold_counts(training, alphabet, offsets, history, folds)
+                      refined = sufficiency_fold_counts(training, alphabet, child, history, folds)
+                      split = whole.zip(refined).map { |w, r| w.zip(r).map { |a, b| a - b } }
+                      naive_cross_validated(split, mean, predictor.concentration)
+                    else
+                      pattern_evidence(rest, mean, predictor)
+                    end
+      step = Math.log(1 - predictor.stop) + Math.log(share) + disagreeing
       sufficiency_paths(training, predictor, history, child, log_so_far + step, joint)
     end
   end
@@ -301,6 +336,24 @@ describe Mobius::SufficiencyPredictor do
       masked.patterns(history).each { |p| p.weight.should be_close(expected[p.shape]? || 0.0, 1e-12) }
       masked.probability(masked.patterns(history), corpus[position])
         .should be_close(suffixes.probability(suffixes.patterns(history), corpus[position]), 1e-12)
+    end
+  end
+
+  it "with cross-validated evidence, matches every refinement path" do
+    { {1, 4.0, 32.0, nil, 3, false}, {1, 2.0, nil, nil, 2, true}, {1, 4.0, 8.0, 0.9, 4, false} }.each do |min_support, strength, chain, nearest, folds, suffixes_only|
+      predictor = Mobius::SufficiencyPredictor.new(index, 4, min_support, strength, 0.5,
+        suffixes_only: suffixes_only, hierarchical: true, chain_strength: chain, nearest_prior: nearest, folds: folds)
+      300.step(to: 356, by: 7).each do |position|
+        history = corpus[0, position]
+        expected = sufficiency_brute_force(training, predictor, history)
+        actual = predictor.patterns(history)
+        actual.sum(&.weight).should be_close(1.0, 1e-9)
+        actual.each do |pattern|
+          offsets = (1..4).select { |o| pattern.shape.bit(o - 1) == 1 }
+          pattern.weight.should be_close(expected[offsets], 1e-9)
+        end
+        actual.size.should eq(expected.count { |_, weight| weight > 0 })
+      end
     end
   end
 

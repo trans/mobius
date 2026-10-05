@@ -24,7 +24,7 @@ module Mobius
     mobius lattice <corpus.txt> [window=16] [k=1,4,16,64] [support=2,5,10,25] [stride=20]
     mobius neighbors <corpus.txt> <context> [window=16] [k=16] [support=2]
     mobius sufficiency <corpus.txt> [window=16] [support=2,10] [prior=0.5,2,8] [discount=D,...] [chain=C,...]
-                       [nearest=P,...] [stride=100] [offset=0] [suffixes] [hierarchical] [test]
+                       [nearest=P,...] [folds=K] [stride=100] [offset=0] [suffixes] [hierarchical] [test]
     mobius sufficient <corpus.txt> <context> [window=16] [support=2] [prior=2] [discount=D] [chain=C]
                       [nearest=P] [suffixes] [hierarchical]
 
@@ -81,7 +81,9 @@ module Mobius
   gives interpolated absolute discounting. With `chain` (and `hierarchical`),
   parents are estimated from continuation counts, as in Kneser–Ney, at that
   strength. With `nearest`, refining favors the nearest unfixed offset with
-  that probability (1 gives the suffix model). Every `stride`-th byte is
+  that probability (1 gives the suffix model). With `folds`, each stop or
+  refine decision is judged by cross-validation over that many contiguous
+  blocks of the training text. Every `stride`-th byte is
   scored, starting `offset` bytes in. Scores include the paired
   standard error of the difference from Kneser–Ney and the mean number of
   positions in the patterns the weight lands on. The test text is scored
@@ -443,6 +445,8 @@ module Mobius
     nearests = decimal_option(args, "nearest", [] of Float64).map(&.as(Float64?))
     nearests = [nil.as(Float64?)] if nearests.empty?
     offset = decimal_option(args, "offset", [0.0]).first.to_i
+    fold_count = decimal_option(args, "folds", [0.0]).first.to_i
+    folds = fold_count > 0 ? fold_count : nil
     suffixes_only = !args.delete("suffixes").nil?
     hierarchical = !args.delete("hierarchical").nil?
     score_test = !args.delete("test").nil?
@@ -457,7 +461,8 @@ module Mobius
     # standard error of the difference, and the weighted pattern depth.
     score = ->(start : Int32, finish : Int32, support : Int32, prior : Float64, discount : Float64?, chain : Float64?, nearest : Float64?) do
       predictor = SufficiencyPredictor.new(Index.from_bytes(corpus[0, start]), window, support, prior,
-        suffixes_only: suffixes_only, hierarchical: hierarchical, discount: discount, chain_strength: chain, nearest_prior: nearest)
+        suffixes_only: suffixes_only, hierarchical: hierarchical, discount: discount, chain_strength: chain, nearest_prior: nearest,
+        folds: folds)
       kneser_ney = KneserNey.new(SuffixArray.new(corpus[0, start]), 6)
       positions = (start + offset...finish).step(stride).to_a
       differences = [] of Float64
@@ -482,7 +487,7 @@ module Mobius
       {bits / n, reference / n, error, depth / n, n, seconds}
     end
 
-    puts "options: window=#{window} support=#{options["support"].join(',')} prior=#{priors.join(',')} discount=#{discounts.map { |d| d || "none" }.join(',')} chain=#{chains.map { |c| c || "none" }.join(',')} nearest=#{nearests.map { |n| n || "uniform" }.join(',')} stride=#{stride} offset=#{offset}#{suffixes_only ? " suffixes" : ""}#{hierarchical ? " hierarchical" : ""}"
+    puts "options: window=#{window} support=#{options["support"].join(',')} prior=#{priors.join(',')} discount=#{discounts.map { |d| d || "none" }.join(',')} chain=#{chains.map { |c| c || "none" }.join(',')} nearest=#{nearests.map { |n| n || "uniform" }.join(',')} folds=#{folds || "none"} stride=#{stride} offset=#{offset}#{suffixes_only ? " suffixes" : ""}#{hierarchical ? " hierarchical" : ""}"
     puts "development: every #{stride}th byte of [#{dev_start + offset},#{test_start}), counts from [0,#{dev_start})"
     puts "support\tprior\tdiscount\tchain\tnearest\tbits_per_byte\tkneser_ney\tchange\tpaired_se\tdepth\tms_per_byte"
     results = options["support"].flat_map do |support|
