@@ -39,15 +39,44 @@ module Mobius
       @slots[byte.to_i]
     end
 
-    # Calls the block with each pattern's shape, support and next-byte counts
-    # by alphabet slot: first the empty pattern, then every pattern with at
-    # least `min_support` matches. The walk goes below a pattern only when the
-    # block returns true for it.
-    def each(history : Bytes, min_support : Int32, &visit : UInt32, Int32, Slice(Int32) -> Bool) : Nil
+    # Calls the block with each pattern's shape, support, next-byte counts by
+    # alphabet slot, and depth in the walk: first the empty pattern, then every
+    # pattern with at least `min_support` matches. The walk goes below a
+    # pattern only when the block returns true for it. During the call,
+    # `continuation_counts(depth, offset)` describes that pattern's matches.
+    def each(history : Bytes, min_support : Int32, &visit : UInt32, Int32, Slice(Int32), Int32 -> Bool) : Nil
       @sets[0] = @full
       @as_set[0] = true
-      return unless visit.call(0_u32, @index.corpus_size, @unigram_counts.dup)
+      return unless visit.call(0_u32, @index.corpus_size, @unigram_counts.dup, 0)
       walk(history, min_support, 0, 0_u32, 1, visit)
+    end
+
+    # For the pattern at `depth` of the current walk: for each next byte, by
+    # slot, how many distinct bytes occur `offset` places before its matches.
+    # A match fewer than `offset` bytes from the start of the text counts the
+    # start as one more distinct value.
+    def continuation_counts(depth : Int32, offset : Int32) : Slice(Int32)
+      corpus = @index.corpus
+      seen = Slice(UInt64).new(@alphabet.size * 5, 0_u64)
+      result = Slice(Int32).new(@alphabet.size, 0)
+      each_position(depth) do |position|
+        next_slot = @slots[corpus[position].to_i]
+        before = position >= offset ? corpus[position - offset].to_i : 256
+        word = next_slot * 5 + before // 64
+        bit = 1_u64 << (before % 64)
+        if seen[word] & bit == 0
+          seen[word] |= bit
+          result[next_slot] += 1
+        end
+      end
+      result
+    end
+
+    # Continuation counts of the empty pattern, which match every position.
+    def empty_continuation_counts(offset : Int32) : Slice(Int32)
+      @sets[0] = @full
+      @as_set[0] = true
+      continuation_counts(0, offset)
     end
 
     # The pattern as a query string: history bytes at its offsets, `*` elsewhere.
@@ -71,12 +100,25 @@ module Mobius
     end
 
     private def walk(history : Bytes, min_support : Int32, depth : Int32, shape : UInt32, first : Int32,
-                     visit : Proc(UInt32, Int32, Slice(Int32), Bool)) : Nil
+                     visit : Proc(UInt32, Int32, Slice(Int32), Int32, Bool)) : Nil
       first.upto(Math.min(@window, history.size)) do |offset|
         support = restrict(depth, offset, history[history.size - offset])
         next if support < min_support
         child = shape | (1_u32 << (offset - 1))
-        walk(history, min_support, depth + 1, child, offset + 1, visit) if visit.call(child, support, counts(depth + 1))
+        walk(history, min_support, depth + 1, child, offset + 1, visit) if visit.call(child, support, counts(depth + 1), depth + 1)
+      end
+    end
+
+    private def each_position(depth : Int32, &)
+      if @as_set[depth]
+        @sets[depth].each_with_index do |bits, word|
+          while bits != 0
+            yield word * 64 + bits.trailing_zeros_count
+            bits &= bits - 1
+          end
+        end
+      else
+        @lists[depth].each { |position| yield position }
       end
     end
 
@@ -111,16 +153,7 @@ module Mobius
     private def counts(depth : Int32) : Slice(Int32)
       corpus = @index.corpus
       counts = Slice(Int32).new(@alphabet.size, 0)
-      if @as_set[depth]
-        @sets[depth].each_with_index do |bits, word|
-          while bits != 0
-            counts[@slots[corpus[word * 64 + bits.trailing_zeros_count].to_i]] += 1
-            bits &= bits - 1
-          end
-        end
-      else
-        @lists[depth].each { |position| counts[@slots[corpus[position].to_i]] += 1 }
-      end
+      each_position(depth) { |position| counts[@slots[corpus[position].to_i]] += 1 }
       counts
     end
   end

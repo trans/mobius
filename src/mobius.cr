@@ -23,8 +23,10 @@ module Mobius
     mobius recency <corpus.txt> [limit=6] [context=7] [spans=500,2000,10000,50000]
     mobius lattice <corpus.txt> [window=16] [k=1,4,16,64] [support=2,5,10,25] [stride=20]
     mobius neighbors <corpus.txt> <context> [window=16] [k=16] [support=2]
-    mobius sufficiency <corpus.txt> [window=16] [support=2,10] [prior=0.5,2,8] [stride=100] [suffixes]
-    mobius sufficient <corpus.txt> <context> [window=16] [support=2] [prior=2] [suffixes]
+    mobius sufficiency <corpus.txt> [window=16] [support=2,10] [prior=0.5,2,8] [discount=D,...] [chain=C,...]
+                       [nearest=P,...] [stride=100] [offset=0] [suffixes] [hierarchical] [test]
+    mobius sufficient <corpus.txt> <context> [window=16] [support=2] [prior=2] [discount=D] [chain=C]
+                      [nearest=P] [suffixes] [hierarchical]
 
   Pattern syntax: * ignores one byte; \\* matches a literal *, and
   \\n, \\r, \\t, \\xHH encode literal bytes. Distance 1 is the next byte.
@@ -72,7 +74,18 @@ module Mobius
   frequencies). It chooses `support` and `prior` on the development text and
   scores the test text the same way. `sufficient` shows the weights for one
   context. With `suffixes`, patterns may only grow by the next older offset,
-  so only contiguous suffixes are used.
+  so only contiguous suffixes are used. With `hierarchical`, each pattern's
+  prior is centered on its parent's estimate (the pattern without its farthest
+  offset) instead of on the byte frequencies. With `discount`, estimates are
+  Pitman–Yor (discount D, strength `prior`) instead of Dirichlet; `prior=0`
+  gives interpolated absolute discounting. With `chain` (and `hierarchical`),
+  parents are estimated from continuation counts, as in Kneser–Ney, at that
+  strength. With `nearest`, refining favors the nearest unfixed offset with
+  that probability (1 gives the suffix model). Every `stride`-th byte is
+  scored, starting `offset` bytes in. Scores include the paired
+  standard error of the difference from Kneser–Ney and the mean number of
+  positions in the patterns the weight lands on. The test text is scored
+  only when `test` is given.
   TEXT
 
   def self.display_byte(byte : UInt8) : String
@@ -407,14 +420,14 @@ module Mobius
     end
   end
 
-  # Splits off a name=list option of positive decimals.
+  # Splits off a name=list option of non-negative decimals.
   def self.decimal_option(args : Array(String), name : String, default : Array(Float64)) : Array(Float64)
     found = args.find { |arg| arg.starts_with?("#{name}=") }
     return default unless found
     args.delete(found)
     found.partition('=')[2].split(',').map do |item|
       value = item.to_f?
-      raise ArgumentError.new("#{name} needs positive numbers") unless value && value > 0
+      raise ArgumentError.new("#{name} needs non-negative numbers") unless value && value >= 0
       value
     end
   end
@@ -423,45 +436,76 @@ module Mobius
     raise ArgumentError.new(USAGE) if args.empty?
     corpus = File.read(args.shift).to_slice
     priors = decimal_option(args, "prior", [0.5, 2.0, 8.0])
+    discounts = decimal_option(args, "discount", [] of Float64).map(&.as(Float64?))
+    discounts = [nil.as(Float64?)] if discounts.empty?
+    chains = decimal_option(args, "chain", [] of Float64).map(&.as(Float64?))
+    chains = [nil.as(Float64?)] if chains.empty?
+    nearests = decimal_option(args, "nearest", [] of Float64).map(&.as(Float64?))
+    nearests = [nil.as(Float64?)] if nearests.empty?
+    offset = decimal_option(args, "offset", [0.0]).first.to_i
     suffixes_only = !args.delete("suffixes").nil?
+    hierarchical = !args.delete("hierarchical").nil?
+    score_test = !args.delete("test").nil?
     options = list_options(args, {"window" => [16], "support" => [2, 10], "stride" => [100]})
     window = options["window"].first
     stride = options["stride"].first
+    raise ArgumentError.new("offset must be less than the stride") unless offset < stride
     test_start = training_end(corpus.size)
     dev_start = training_end(test_start)
-    # Mean bits per byte on every stride-th byte of [start, finish), counts from
-    # [0, start), with Kneser–Ney on the same bytes.
-    score = ->(start : Int32, finish : Int32, support : Int32, prior : Float64) do
-      predictor = SufficiencyPredictor.new(Index.from_bytes(corpus[0, start]), window, support, prior, suffixes_only: suffixes_only)
+    # Bits per byte on every stride-th byte of [start, finish), counts from
+    # [0, start), against Kneser–Ney on the same bytes: means, the paired
+    # standard error of the difference, and the weighted pattern depth.
+    score = ->(start : Int32, finish : Int32, support : Int32, prior : Float64, discount : Float64?, chain : Float64?, nearest : Float64?) do
+      predictor = SufficiencyPredictor.new(Index.from_bytes(corpus[0, start]), window, support, prior,
+        suffixes_only: suffixes_only, hierarchical: hierarchical, discount: discount, chain_strength: chain, nearest_prior: nearest)
       kneser_ney = KneserNey.new(SuffixArray.new(corpus[0, start]), 6)
-      positions = (start...finish).step(stride).to_a
+      positions = (start + offset...finish).step(stride).to_a
+      differences = [] of Float64
       bits = 0.0
       reference = 0.0
+      depth = 0.0
       started = Time.instant
       positions.each do |position|
         history = corpus[0, position]
-        bits -= Math.log2(predictor.probability(predictor.patterns(history), corpus[position]))
-        reference -= Math.log2(kneser_ney.probability(history, corpus[position], 6))
+        patterns = predictor.patterns(history)
+        model = -Math.log2(predictor.probability(patterns, corpus[position]))
+        baseline = -Math.log2(kneser_ney.probability(history, corpus[position], 6))
+        bits += model
+        reference += baseline
+        differences << model - baseline
+        depth += patterns.sum { |pattern| pattern.weight * pattern.shape.popcount }
       end
       seconds = (Time.instant - started).total_seconds
-      {bits / positions.size, reference / positions.size, positions.size, seconds}
+      n = positions.size
+      mean = differences.sum / n
+      error = Math.sqrt(differences.sum { |d| (d - mean) ** 2 } / (n - 1) / n)
+      {bits / n, reference / n, error, depth / n, n, seconds}
     end
 
-    puts "options: window=#{window} support=#{options["support"].join(',')} prior=#{priors.join(',')} stride=#{stride}#{suffixes_only ? " suffixes" : ""}"
-    puts "development: every #{stride}th byte of [#{dev_start},#{test_start}), counts from [0,#{dev_start})"
-    puts "support\tprior\tbits_per_byte\tkneser_ney\tchange\tms_per_byte"
+    puts "options: window=#{window} support=#{options["support"].join(',')} prior=#{priors.join(',')} discount=#{discounts.map { |d| d || "none" }.join(',')} chain=#{chains.map { |c| c || "none" }.join(',')} nearest=#{nearests.map { |n| n || "uniform" }.join(',')} stride=#{stride} offset=#{offset}#{suffixes_only ? " suffixes" : ""}#{hierarchical ? " hierarchical" : ""}"
+    puts "development: every #{stride}th byte of [#{dev_start + offset},#{test_start}), counts from [0,#{dev_start})"
+    puts "support\tprior\tdiscount\tchain\tnearest\tbits_per_byte\tkneser_ney\tchange\tpaired_se\tdepth\tms_per_byte"
     results = options["support"].flat_map do |support|
-      priors.map do |prior|
-        bits, reference, sampled, seconds = score.call(dev_start, test_start, support, prior)
-        puts "#{support}\t#{prior}\t#{bits.round(4)}\t#{reference.round(4)}\t#{(bits - reference).round(4)}\t#{(1000 * seconds / sampled).round(1)}"
-        {support, prior, bits}
+      priors.flat_map do |prior|
+        discounts.flat_map do |discount|
+          chains.flat_map do |chain|
+            nearests.map do |nearest|
+              bits, reference, error, depth, sampled, seconds = score.call(dev_start, test_start, support, prior, discount, chain, nearest)
+              puts "#{support}\t#{prior}\t#{discount || "none"}\t#{chain || "none"}\t#{nearest || "uniform"}\t#{bits.round(4)}\t#{reference.round(4)}\t#{(bits - reference).round(4)}\t#{error.round(4)}\t#{depth.round(2)}\t#{(1000 * seconds / sampled).round(1)}"
+              {support, prior, discount, chain, nearest, bits}
+            end
+          end
+        end
       end
     end
-    support, prior, _ = results.min_by { |entry| entry[2] }
-    bits, reference, sampled, _ = score.call(test_start, corpus.size, support, prior)
-    puts "test: every #{stride}th byte of [#{test_start},#{corpus.size}), #{sampled} bytes, counts from [0,#{test_start}), support=#{support} prior=#{prior}"
-    puts "kneser_ney_bits_per_byte=#{reference.round(4)}"
-    puts "sufficiency_bits_per_byte=#{bits.round(4)} change=#{(bits - reference).round(4)}"
+    support, prior, discount, chain, nearest, _ = results.min_by { |entry| entry[5] }
+    puts "chosen: support=#{support} prior=#{prior} discount=#{discount || "none"} chain=#{chain || "none"} nearest=#{nearest || "uniform"}"
+    if score_test
+      bits, reference, error, depth, sampled, _ = score.call(test_start, corpus.size, support, prior, discount, chain, nearest)
+      puts "test: every #{stride}th byte of [#{test_start},#{corpus.size}), #{sampled} bytes, counts from [0,#{test_start})"
+      puts "kneser_ney_bits_per_byte=#{reference.round(4)}"
+      puts "sufficiency_bits_per_byte=#{bits.round(4)} change=#{(bits - reference).round(4)} paired_se=#{error.round(4)} depth=#{depth.round(2)}"
+    end
   end
 
   def self.sufficient(args : Array(String)) : Nil
@@ -469,11 +513,15 @@ module Mobius
     corpus = File.read(args.shift).to_slice
     history = literal_bytes(args.shift)
     prior = decimal_option(args, "prior", [2.0]).first
+    discount = decimal_option(args, "discount", [] of Float64).first?
+    chain = decimal_option(args, "chain", [] of Float64).first?
+    nearest = decimal_option(args, "nearest", [] of Float64).first?
     suffixes_only = !args.delete("suffixes").nil?
+    hierarchical = !args.delete("hierarchical").nil?
     options = list_options(args, {"window" => [16], "support" => [2]})
     counts_end = training_end(corpus.size)
     predictor = SufficiencyPredictor.new(Index.from_bytes(corpus[0, counts_end]), options["window"].first, options["support"].first, prior,
-      suffixes_only: suffixes_only)
+      suffixes_only: suffixes_only, hierarchical: hierarchical, discount: discount, chain_strength: chain, nearest_prior: nearest)
     patterns = predictor.patterns(history)
     puts "context=#{display_bytes(history)} counts_from=[0,#{counts_end}) window=#{options["window"].first} support>=#{options["support"].first} prior=#{prior}"
     puts "patterns_with_weight=#{patterns.size}"

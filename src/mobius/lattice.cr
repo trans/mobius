@@ -65,7 +65,7 @@ module Mobius
     def patterns(history : Bytes) : Array(LatticePattern)
       @kept = [] of LatticePattern
       @keys = Set(UInt64).new
-      @search.each(history, @min_support) do |shape, support, counts|
+      @search.each(history, @min_support) do |shape, support, counts, _|
         offer(shape, support, counts)
         shape == 0 || @kept.size < @capacity || attainable(support) > @kept.last.weight
       end
