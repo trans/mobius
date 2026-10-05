@@ -17,3 +17,4 @@ The order in which the experiments under `rnd/` were tried. Each directory's
 | 10 | 2026-10-05 | [continuation-sufficiency](continuation-sufficiency/) | Ties Kneser–Ney with suffixes only (+0.0011 ± 0.0028 on held-back bytes). Masks still worse. |
 | 11 | 2026-10-05 | [nested-mask-prior](nested-mask-prior/) | Negative: even at 1% prior, training evidence pulls masks in, and they cost 0.64 bits where they take over. |
 | 12 | 2026-10-05 | [cross-fitted-evidence](cross-fitted-evidence/) | Negative: judging refinements on held-out training folds does not keep masks out (+0.156). |
+| 13 | 2026-10-05 | [interaction-probe](interaction-probe/) | Design: Möbius decomposition of nanoGPT and the counts, with corpus matches as fills, to find the negative interactions. |
